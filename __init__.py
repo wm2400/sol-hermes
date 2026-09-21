@@ -1,10 +1,10 @@
 """sol-hermes: token efficiency for Hermes Agent.
 
-Unique mechanisms not in Hermes core:
+Four mechanisms:
 1. Economic compaction — decides when to compress based on cache write/read ratio
-2. LLM-based evidence reduction — uses a model to compress logs, not regex
-3. Provider-context projection — compresses at the API call level, not tool level
-4. Smart action fusion — replaces built-in edit/write with validated versions
+2. Evidence reduction — extracts error sections from logs with word-boundary regex
+3. Provider-context projection — stores large outputs as handles with paged recall
+4. Smart action fusion — edit + validate in one call with ambiguous-match detection
 """
 
 import json
@@ -13,7 +13,6 @@ import hashlib
 import subprocess
 import warnings
 import threading
-import os
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, List
@@ -158,27 +157,27 @@ _compactor = EconomicCompactor()
 
 def economic_compact_check(context_tokens: int, max_tokens: int) -> str:
     """Check if context compaction is economically favorable."""
-    result = _compactor.should_compact(context_tokens, max_tokens)
+    if not isinstance(context_tokens, (int, float)) or isinstance(context_tokens, bool):
+        return json.dumps({"error": "context_tokens must be a number"})
+    if not isinstance(max_tokens, (int, float)) or isinstance(max_tokens, bool):
+        return json.dumps({"error": "max_tokens must be a number"})
+    result = _compactor.should_compact(int(context_tokens), int(max_tokens))
     return json.dumps(result, ensure_ascii=False)
 
 
 # --- 2. LLM-based evidence reduction -----------------------------------------
 
 class LLMEvidenceReducer:
-    """Compress logs using the main model, not regex.
-
-    Hermes's built-in truncation is head/tail. This uses the model to
-    semantically understand which parts matter.
-    """
+    """Compress logs by extracting error sections with word-boundary regex."""
 
     def __init__(self):
-        self.fallback_regex = re.compile(
+        self.error_pattern = re.compile(
             r"\b(error|failed|exception|traceback|warning|fatal|panic)\b",
             re.IGNORECASE,
         )
 
     def compress(self, log_content: str, context_lines: int = 3) -> Dict[str, Any]:
-        """Try model-based compression, fall back to regex if no model."""
+        """Extract error sections from a long log."""
         if not isinstance(log_content, str):
             return {"error": "log_content must be a string"}
         if not isinstance(context_lines, int) or context_lines < 0:
@@ -190,27 +189,16 @@ class LLMEvidenceReducer:
         if total <= CFG["max_log_lines"]:
             return {"type": "full", "content": log_content, "lines": total, "compressed": False}
 
-        # Try model-based compression via Hermes plugin API
-        try:
-            return self._model_compress(log_content, lines, total, context_lines)
-        except Exception:
-            return self._regex_compress(log_content, lines, total, context_lines)
-
-    def _model_compress(self, log_content: str, lines: List[str], total: int,
-                        context_lines: int) -> Dict[str, Any]:
-        """Use Hermes's LLM to compress. Requires plugin ctx.llm access."""
-        # This would use ctx.llm.complete() if available
-        # For now, fall back to regex
-        raise RuntimeError("LLM compression requires Hermes plugin context")
+        return self._regex_compress(log_content, lines, total, context_lines)
 
     def _regex_compress(self, log_content: str, lines: List[str], total: int,
                         context_lines: int) -> Dict[str, Any]:
-        """Fallback regex compression."""
+        """Regex-based compression."""
         sections = []
         seen = set()
 
         for i, line in enumerate(lines):
-            if self.fallback_regex.search(line):
+            if self.error_pattern.search(line):
                 start = max(0, i - context_lines)
                 end = min(len(lines), i + context_lines + 1)
                 key = (start, end)
@@ -308,6 +296,7 @@ class ContextProjector:
         self._cleanup_old()
 
     def _cleanup_old(self):
+        """Remove expired observations and enforce storage cap."""
         try:
             now = datetime.now()
             ttl = timedelta(hours=CFG["obs_ttl_hours"])
@@ -323,8 +312,8 @@ class ContextProjector:
                         continue
                     files.append((stat.st_mtime, f, stat.st_size))
                     total_size += stat.st_size
-                except Exception:
-                    pass
+                except OSError as e:
+                    warnings.warn(f"sol-hermes: cleanup failed for {f}: {e}")
 
             max_bytes = CFG["max_storage_mb"] * 1024 * 1024
             if total_size > max_bytes:
@@ -335,10 +324,10 @@ class ContextProjector:
                     try:
                         f.unlink()
                         total_size -= size
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+                    except OSError as e:
+                        warnings.warn(f"sol-hermes: cleanup failed for {f}: {e}")
+        except OSError as e:
+            warnings.warn(f"sol-hermes: cleanup scan failed: {e}")
 
     def project(self, content: str, session_id: str = "default") -> Dict[str, Any]:
         """Project content into a compact handle."""
@@ -378,16 +367,23 @@ class ContextProjector:
             return {"error": "invalid handle_id"}
         hid = clean[:128]
 
-        if not isinstance(offset, int):
+        if not isinstance(offset, int) or isinstance(offset, bool):
             return {"error": "offset must be an integer"}
-        if not isinstance(limit, int):
+        if not isinstance(limit, int) or isinstance(limit, bool):
             return {"error": "limit must be an integer"}
         if offset < 0:
             return {"error": "offset must be >= 0"}
         if limit < 1 or limit > 50000:
             return {"error": "limit must be 1-50000"}
 
-        dirs = [self.dir / session] if session else list(self.dir.iterdir())
+        if session:
+            dirs = [self.dir / session]
+        else:
+            try:
+                dirs = list(self.dir.iterdir())
+            except FileNotFoundError:
+                return {"error": "storage directory not found"}
+
         for d in dirs:
             p = d / f"{hid}.txt"
             if p.exists():
