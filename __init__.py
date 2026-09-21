@@ -23,12 +23,12 @@ def load_config():
         "max_storage_mb": 500,
         "obs_ttl_hours": 24,
         "validators": {
-            ".py": ["python3", "-m", "py_compile"],
-            ".js": ["node", "--check"],
-            ".ts": ["npx", "tsc", "--noEmit"],
-            ".json": ["python3", "-m", "json.tool"],
-            ".yaml": ["python3", "-c", "import yaml,sys; yaml.safe_load(open(sys.argv[1]))"],
-            ".yml": ["python3", "-c", "import yaml,sys; yaml.safe_load(open(sys.argv[1]))"],
+            ".py": [["python3", "-m", "py_compile"]],
+            ".js": [["node", "--check"]],
+            ".ts": [["npx", "tsc", "--noEmit"]],
+            ".json": [["python3", "-m", "json.tool"]],
+            ".yaml": [["python3", "-c", "import yaml,sys; yaml.safe_load(open(sys.argv[1]))"]],
+            ".yml": [["python3", "-c", "import yaml,sys; yaml.safe_load(open(sys.argv[1]))"]],
         },
     }
     if not config_path.exists():
