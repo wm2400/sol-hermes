@@ -39,9 +39,9 @@ class TestEconomicCompactor(unittest.TestCase):
         result = plugin._compactor.should_compact(10000, 100000)
         self.assertFalse(result["window_pressure"])
 
-    def test_record_compaction(self):
-        plugin._compactor.record_compaction(50000, 15000)
-        self.assertEqual(plugin._compactor.compactions, 1)
+    def test_record_compaction_removed(self):
+        # record_compaction was removed as dead code
+        self.assertFalse(hasattr(plugin._compactor, 'record_compaction'))
 
 
 class TestActionFusion(unittest.TestCase):

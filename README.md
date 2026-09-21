@@ -1,6 +1,6 @@
 # sol-hermes
 
-Token-efficiency plugin for Hermes Agent. Four mechanisms not in Hermes core.
+Token-efficiency plugin for Hermes Agent. Four mechanisms, all local, no extra API calls.
 
 ## What it does
 
@@ -8,7 +8,7 @@ Token-efficiency plugin for Hermes Agent. Four mechanisms not in Hermes core.
 
 **context_project / context_recall** — projects large tool results into compact handles before the provider sees them. Unlike Hermes's built-in truncation (head+tail at 100KB), this uses configurable thresholds and stores full content for paged recall.
 
-**evidence_compress / evidence_verify** — extracts error sections from logs with word-boundary regex. Falls back to regex if no LLM is available for semantic compression.
+**evidence_compress / evidence_verify** — extracts error sections from logs with word-boundary regex. No false positives on "errorless".
 
 **sol_patch_validate** — edit + validate in one call. Detects ambiguous matches (rejects if old_string appears multiple times without replace_all).
 

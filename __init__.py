@@ -101,10 +101,6 @@ class EconomicCompactor:
     ratio to determine if compaction is economically favorable.
     """
 
-    def __init__(self):
-        self.history: List[Dict] = []
-        self.compactions = 0
-
     def should_compact(self, context_tokens: int, max_tokens: int,
                        cache_write_cost: float = 1.0,
                        cache_read_cost: float = 0.08) -> Dict[str, Any]:
@@ -141,15 +137,6 @@ class EconomicCompactor:
             "tokens_after_estimate": int(compressed_estimate),
             "ratio_used": ratio,
         }
-
-    def record_compaction(self, before: int, after: int):
-        self.compactions += 1
-        self.history.append({
-            "timestamp": datetime.now().isoformat(),
-            "before": before,
-            "after": after,
-            "saved": before - after,
-        })
 
 
 _compactor = EconomicCompactor()
@@ -379,10 +366,10 @@ class ContextProjector:
         if session:
             dirs = [self.dir / session]
         else:
-            try:
-                dirs = list(self.dir.iterdir())
-            except FileNotFoundError:
-                return {"error": "storage directory not found"}
+            # Default to "default" session only — no cross-session search
+            dirs = [self.dir / "default"]
+            if not dirs[0].exists():
+                return {"error": "no projections found in default session"}
 
         for d in dirs:
             p = d / f"{hid}.txt"
