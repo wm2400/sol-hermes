@@ -4,7 +4,6 @@ import json
 import re
 import hashlib
 import subprocess
-import shlex
 import warnings
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -49,8 +48,6 @@ def load_config():
 CFG = load_config()
 
 
-# --- token counter -----------------------------------------------------------
-
 def estimate_tokens(text):
     """Rough token estimate: 1 token ~ 4 chars for English, ~3 for code."""
     if not text:
@@ -74,24 +71,20 @@ def count_saved(before, after):
 
 def get_validators(path):
     ext = Path(path).suffix.lower()
-    cmds = CFG["validators"].get(ext, [])
-    return cmds
+    return CFG["validators"].get(ext, [])
 
 
-def run_cmd(cmd_list, cwd):
+def run_cmd(cmd_list, file_path):
     """Run validator without shell=True. Path passed as argv, not interpolated."""
     try:
-        # Append the file path as the last argument
-        full_cmd = cmd_list + [cwd] if "{path}" not in " ".join(cmd_list) else [
-            c.replace("{path}", cwd) for c in cmd_list
-        ]
+        full_cmd = [c.replace("{path}", file_path) for c in cmd_list]
         p = subprocess.run(
             full_cmd,
             shell=False,
             capture_output=True,
             text=True,
             timeout=30,
-            cwd=str(Path(cwd).parent),
+            cwd=str(Path(file_path).parent),
         )
         return {
             "cmd": " ".join(full_cmd),
@@ -184,6 +177,8 @@ class ObsStore:
         return re.sub(r"[^a-zA-Z0-9_-]", "", session)[:64] or "default"
 
     def put(self, content, kind="text", session="default"):
+        if not isinstance(content, str):
+            return {"type": "inline", "content": str(content), "chars": 0}
         if len(content) < CFG["observation_threshold"]:
             return {"type": "inline", "content": content, "chars": len(content)}
 
@@ -306,7 +301,6 @@ def evidence_compress(log_content, context_lines=3):
 
 def evidence_verify(compressed_content, original_content):
     """Check that every quoted section actually exists in the original."""
-    # Extract only the raw content lines, skip section headers
     lines = compressed_content.split("\n")
     sections = []
     current = []
@@ -483,7 +477,6 @@ def register(ctx):
         ),
     )
 
-    # This hook actually replaces large results, not just logs them
     ctx.register_hook("transform_tool_result", _transform_result)
 
     print("[sol-hermes] loaded")

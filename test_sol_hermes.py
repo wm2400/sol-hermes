@@ -64,6 +64,15 @@ class TestActionFusion(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertIn("empty", result["error"])
 
+    def test_no_shell_injection(self):
+        # Create a file with a shell metachar in name
+        evil = os.path.join(self.tmp, "test;touch INJECTED;.py")
+        with open(evil, "w") as f:
+            f.write("x = 1\n")
+        result = json.loads(plugin.sol_patch_validate(evil, "x = 1", "x = 2", validate=True))
+        self.assertTrue(result["ok"])
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "INJECTED")))
+
 
 class TestObservationPack(unittest.TestCase):
     def setUp(self):
@@ -127,6 +136,10 @@ class TestObservationPack(unittest.TestCase):
         result = json.loads(plugin.observation_recall(packed["handle_id"], 0, 99999))
         self.assertIn("error", result)
 
+    def test_non_string_input(self):
+        result = json.loads(plugin.observation_pack(None))
+        self.assertEqual(result["type"], "inline")
+
 
 class TestEvidenceReducer(unittest.TestCase):
     def test_small_log_full(self):
@@ -143,7 +156,6 @@ class TestEvidenceReducer(unittest.TestCase):
         self.assertIn("token_stats", result)
 
     def test_word_boundary(self):
-        # "errorless" should NOT trigger
         lines = ["INFO: errorless operation"] * 100
         log = "\n".join(lines)
         result = json.loads(plugin.evidence_compress(log))
