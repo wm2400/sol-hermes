@@ -1,16 +1,16 @@
 # sol-hermes
 
-Hermes plugin that cuts token usage. Four mechanisms, all local, no extra API calls.
+Token-efficiency plugin for Hermes Agent. Four mechanisms not in Hermes core.
 
 ## What it does
 
-**sol_patch_validate** — edit a file and run its syntax check in one tool call instead of two. Validators run without `shell=True` (list-form subprocess, no injection). Empty `old_string` rejected.
+**economic_compact_check** — decides when to compress context using a cache write/read ratio (default 12.5). Hermes uses fixed 50%/85% thresholds; this uses economics.
 
-**observation_pack / observation_recall** — large tool output stored on disk, model gets a short handle. Session names sanitized to prevent path traversal. Recall validates offset/limit.
+**context_project / context_recall** — projects large tool results into compact handles before the provider sees them. Unlike Hermes's built-in truncation (head+tail at 100KB), this uses configurable thresholds and stores full content for paged recall.
 
-**transform_tool_result hook** — automatically replaces oversized `terminal`, `read_file`, `search_files` results with a handle before the model sees them. This is the real token saver.
+**evidence_compress / evidence_verify** — extracts error sections from logs with word-boundary regex. Falls back to regex if no LLM is available for semantic compression.
 
-**evidence_compress / evidence_verify** — pulls error sections from logs with word-boundary regex (no false positives on "errorless"). Verify strips section headers before matching.
+**sol_patch_validate** — edit + validate in one call. Detects ambiguous matches (rejects if old_string appears multiple times without replace_all).
 
 ## Install
 
@@ -18,7 +18,7 @@ Hermes plugin that cuts token usage. Four mechanisms, all local, no extra API ca
 git clone https://github.com/wm2400/sol-hermes ~/.hermes/plugins/sol-hermes
 ```
 
-Add `sol-hermes` to `plugins.enabled` in `~/.hermes/config.yaml`:
+Add to `plugins.enabled` in `~/.hermes/config.yaml`:
 
 ```yaml
 plugins:
@@ -36,24 +36,26 @@ sh ~/.hermes/plugins/sol-hermes/uninstall.sh
 
 ## Config
 
-Only from `~/.hermes/sol-hermes.json` (never from project directory — security boundary):
+`~/.hermes/sol-hermes.json`:
 
 ```json
 {
   "action_fusion": true,
   "observation_pack": true,
   "evidence_reducer": true,
+  "online_compact": true,
   "observation_threshold": 4000,
   "max_log_lines": 80,
   "max_storage_mb": 500,
-  "obs_ttl_hours": 24
+  "obs_ttl_hours": 24,
+  "cache_write_read_ratio": 12.5
 }
 ```
 
 ## Security
 
 - No `shell=True` — validators run as list-form subprocess
-- Session names sanitized to `[a-zA-Z0-9_-]`
+- `handle_id` and `session_id` sanitized to `[a-zA-Z0-9_-]`
 - Config loaded only from `~/.hermes/`, never from CWD
 - Observations auto-delete after 24h, storage capped at 500MB
 - No network calls, no telemetry

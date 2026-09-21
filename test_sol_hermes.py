@@ -25,8 +25,23 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(stats["saved_percent"], 90.0)
 
     def test_config_crash_graceful(self):
-        # Malformed config should not crash module import
         self.assertIsNotNone(plugin.CFG)
+
+
+class TestEconomicCompactor(unittest.TestCase):
+    def test_should_compact_economic(self):
+        result = plugin._compactor.should_compact(50000, 100000)
+        self.assertIn("should_compact", result)
+        self.assertIn("economically_favorable", result)
+        self.assertIn("window_pressure", result)
+
+    def test_should_not_compact_low_pressure(self):
+        result = plugin._compactor.should_compact(10000, 100000)
+        self.assertFalse(result["window_pressure"])
+
+    def test_record_compaction(self):
+        plugin._compactor.record_compaction(50000, 15000)
+        self.assertEqual(plugin._compactor.compactions, 1)
 
 
 class TestActionFusion(unittest.TestCase):
@@ -46,7 +61,7 @@ class TestActionFusion(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertTrue(result["edit_applied"])
         self.assertIn("validation", result)
-        self.assertIn("token_stats", result)
+        self.assertIn("turns_saved", result)
 
     def test_patch_no_validate(self):
         result = json.loads(plugin.sol_patch_validate(
@@ -69,6 +84,15 @@ class TestActionFusion(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertIn("empty", result["error"])
 
+    def test_ambiguous_match_rejected(self):
+        with open(self.test_file, "w") as f:
+            f.write("x = 1\nx = 2\nx = 3\n")
+        result = json.loads(plugin.sol_patch_validate(
+            self.test_file, "x = ", "y = ", replace_all=False
+        ))
+        self.assertFalse(result["ok"])
+        self.assertIn("ambiguous", result["error"])
+
     def test_no_shell_injection(self):
         evil = os.path.join(self.tmp, "test;touch INJECTED;.py")
         with open(evil, "w") as f:
@@ -80,48 +104,48 @@ class TestActionFusion(unittest.TestCase):
 
 class TestObservationPack(unittest.TestCase):
     def setUp(self):
-        self.orig_dir = plugin._store.dir
+        self.orig_dir = plugin._projector.dir
         self.tmp = tempfile.mkdtemp()
-        plugin._store.dir = Path(self.tmp)
+        plugin._projector.dir = Path(self.tmp)
 
     def tearDown(self):
-        plugin._store.dir = self.orig_dir
+        plugin._projector.dir = self.orig_dir
         shutil.rmtree(self.tmp)
 
     def test_small_content_inline(self):
-        result = json.loads(plugin.observation_pack("small"))
+        result = json.loads(plugin.context_project("small"))
         self.assertEqual(result["type"], "inline")
 
-    def test_large_content_handle(self):
+    def test_large_content_projection(self):
         big = "x" * 5000
-        result = json.loads(plugin.observation_pack(big))
-        self.assertEqual(result["type"], "handle")
+        result = json.loads(plugin.context_project(big))
+        self.assertEqual(result["type"], "projection")
         self.assertIn("handle_id", result)
         self.assertIn("token_stats", result)
 
     def test_recall_exact(self):
         big = "line1\n" * 1000
-        packed = json.loads(plugin.observation_pack(big))
-        recalled = json.loads(plugin.observation_recall(packed["handle_id"], 0, 12))
+        packed = json.loads(plugin.context_project(big))
+        recalled = json.loads(plugin.context_recall(packed["handle_id"], 0, 12))
         self.assertEqual(recalled["chunk"], "line1\nline1\n")
 
     def test_session_isolation(self):
         big = "x" * 5000
-        p1 = json.loads(plugin.observation_pack(big, session_id="a"))
-        p2 = json.loads(plugin.observation_pack(big, session_id="b"))
+        p1 = json.loads(plugin.context_project(big, session_id="a"))
+        p2 = json.loads(plugin.context_project(big, session_id="b"))
         self.assertNotEqual(os.path.dirname(p1["path"]), os.path.dirname(p2["path"]))
 
     def test_session_sanitized(self):
         big = "x" * 5000
-        result = json.loads(plugin.observation_pack(big, session_id="../../evil"))
+        result = json.loads(plugin.context_project(big, session_id="../../evil"))
         self.assertNotIn("..", result["path"])
 
     def test_recall_pagination(self):
         big = "0123456789" * 500
-        packed = json.loads(plugin.observation_pack(big))
-        page1 = json.loads(plugin.observation_recall(packed["handle_id"], 0, 100))
-        page2 = json.loads(plugin.observation_recall(packed["handle_id"], 100, 100))
-        page_last = json.loads(plugin.observation_recall(packed["handle_id"], 4900, 100))
+        packed = json.loads(plugin.context_project(big))
+        page1 = json.loads(plugin.context_recall(packed["handle_id"], 0, 100))
+        page2 = json.loads(plugin.context_recall(packed["handle_id"], 100, 100))
+        page_last = json.loads(plugin.context_recall(packed["handle_id"], 4900, 100))
         self.assertTrue(page1["has_more"])
         self.assertEqual(page1["next_offset"], 100)
         self.assertTrue(page2["has_more"])
@@ -130,54 +154,51 @@ class TestObservationPack(unittest.TestCase):
 
     def test_recall_negative_offset(self):
         big = "x" * 5000
-        packed = json.loads(plugin.observation_pack(big))
-        result = json.loads(plugin.observation_recall(packed["handle_id"], -5, 100))
+        packed = json.loads(plugin.context_project(big))
+        result = json.loads(plugin.context_recall(packed["handle_id"], -5, 100))
         self.assertIn("error", result)
 
     def test_recall_offset_string(self):
         big = "x" * 5000
-        packed = json.loads(plugin.observation_pack(big))
-        result = json.loads(plugin.observation_recall(packed["handle_id"], "0", 100))
+        packed = json.loads(plugin.context_project(big))
+        result = json.loads(plugin.context_recall(packed["handle_id"], "0", 100))
         self.assertIn("error", result)
         self.assertEqual(result["error"], "offset must be an integer")
 
     def test_recall_limit_string(self):
         big = "x" * 5000
-        packed = json.loads(plugin.observation_pack(big))
-        result = json.loads(plugin.observation_recall(packed["handle_id"], 0, "100"))
+        packed = json.loads(plugin.context_project(big))
+        result = json.loads(plugin.context_recall(packed["handle_id"], 0, "100"))
         self.assertIn("error", result)
         self.assertEqual(result["error"], "limit must be an integer")
 
     def test_recall_bad_limit(self):
         big = "x" * 5000
-        packed = json.loads(plugin.observation_pack(big))
-        result = json.loads(plugin.observation_recall(packed["handle_id"], 0, 99999))
+        packed = json.loads(plugin.context_project(big))
+        result = json.loads(plugin.context_recall(packed["handle_id"], 0, 99999))
         self.assertIn("error", result)
 
     def test_non_string_input(self):
-        result = json.loads(plugin.observation_pack(None))
+        result = json.loads(plugin.context_project(None))
         self.assertEqual(result["type"], "inline")
 
     def test_handle_id_path_traversal_blocked(self):
-        """handle_id with path traversal should be rejected."""
-        result = json.loads(plugin.observation_recall("../../etc/passwd"))
+        result = json.loads(plugin.context_recall("../../etc/passwd"))
         self.assertIn("error", result)
         self.assertEqual(result["error"], "invalid handle_id")
 
     def test_handle_id_sanitization(self):
-        """handle_id with special chars should be rejected."""
-        result = json.loads(plugin.observation_recall("obs_20260921_abc123; rm -rf /"))
+        result = json.loads(plugin.context_recall("obs_20260921_abc123; rm -rf /"))
         self.assertIn("error", result)
 
     def test_concurrent_put_same_content(self):
-        """Concurrent writes of same content should not corrupt."""
         big = "x" * 5000
         results = []
         errors = []
 
         def worker():
             try:
-                r = json.loads(plugin.observation_pack(big, session_id="concurrent"))
+                r = json.loads(plugin.context_project(big, session_id="concurrent"))
                 results.append(r)
             except Exception as e:
                 errors.append(e)
@@ -190,18 +211,16 @@ class TestObservationPack(unittest.TestCase):
 
         self.assertEqual(len(errors), 0)
         self.assertEqual(len(results), 10)
-        # All should have same handle_id (same content hash)
         handle_ids = {r["handle_id"] for r in results}
         self.assertEqual(len(handle_ids), 1)
 
     def test_concurrent_put_different_content(self):
-        """Concurrent writes of different content should not corrupt."""
         errors = []
 
         def worker(i):
             try:
                 content = f"content_{i}_" + "x" * 5000
-                plugin.observation_pack(content, session_id="concurrent")
+                plugin.context_project(content, session_id="concurrent")
             except Exception as e:
                 errors.append(e)
 
@@ -261,12 +280,12 @@ class TestEvidenceReducer(unittest.TestCase):
 
 class TestTransformHook(unittest.TestCase):
     def setUp(self):
-        self.orig_dir = plugin._store.dir
+        self.orig_dir = plugin._projector.dir
         self.tmp = tempfile.mkdtemp()
-        plugin._store.dir = Path(self.tmp)
+        plugin._projector.dir = Path(self.tmp)
 
     def tearDown(self):
-        plugin._store.dir = self.orig_dir
+        plugin._projector.dir = self.orig_dir
         shutil.rmtree(self.tmp)
 
     def test_small_result_unchanged(self):
@@ -277,7 +296,7 @@ class TestTransformHook(unittest.TestCase):
         big = "x" * 5000
         result = plugin._transform_result("terminal", {}, big)
         data = json.loads(result)
-        self.assertEqual(data["type"], "handle")
+        self.assertEqual(data["type"], "projection")
         self.assertLess(len(result), len(big))
 
     def test_non_string_unchanged(self):
@@ -289,12 +308,11 @@ class TestTransformHook(unittest.TestCase):
         self.assertEqual(result, "x" * 5000)
 
     def test_hook_signature_matches_hermes(self):
-        """Hook must accept (tool_name, args, result, **kw) as Hermes sends."""
         import inspect
         sig = inspect.signature(plugin._transform_result)
         params = list(sig.parameters.keys())
         self.assertEqual(params[0], "tool_name")
-        self.assertEqual(params[1], "args")  # Hermes sends args, not params
+        self.assertEqual(params[1], "args")
         self.assertEqual(params[2], "result")
         self.assertEqual(params[3], "kw")
 
@@ -302,7 +320,7 @@ class TestTransformHook(unittest.TestCase):
 class TestStorageCleanup(unittest.TestCase):
     def test_cleanup_old(self):
         tmp = tempfile.mkdtemp()
-        store = plugin.ObsStore()
+        store = plugin.ContextProjector()
         store.dir = Path(tmp)
         store._cleanup_old()
         shutil.rmtree(tmp)
