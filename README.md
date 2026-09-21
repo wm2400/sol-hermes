@@ -4,16 +4,18 @@ Hermes plugin that cuts token usage. Four mechanisms, all local, no extra API ca
 
 ## What it does
 
-**sol_patch_validate** — edit a file and run its syntax check in one tool call instead of two. A normal `patch` then `terminal: python -m py_compile` costs a full model turn between them. This does both at once. Validators are configurable per file extension.
+**sol_patch_validate** — edit a file and run its syntax check in one tool call instead of two. Validators run without `shell=True` (list-form subprocess, no injection). Empty `old_string` rejected.
 
-**observation_pack / observation_recall** — when a tool returns something huge (test log, big file, find output), this stores it on disk and hands back a short handle with a preview. The model reads exact pages of the original later if it needs to. A `post_tool_call` hook does this automatically for `terminal`, `read_file`, and `search_files` results over 4000 chars.
+**observation_pack / observation_recall** — large tool output stored on disk, model gets a short handle. Session names sanitized to prevent path traversal. Recall validates offset/limit.
 
-**evidence_compress / evidence_verify** — point it at a long log and it pulls out just the error sections with a few lines of context around each. Then you can verify every quoted section exists verbatim in the original. No paraphrasing, no hallucinated lines.
+**transform_tool_result hook** — automatically replaces oversized `terminal`, `read_file`, `search_files` results with a handle before the model sees them. This is the real token saver.
+
+**evidence_compress / evidence_verify** — pulls error sections from logs with word-boundary regex (no false positives on "errorless"). Verify strips section headers before matching.
 
 ## Install
 
 ```bash
-git clone https://github.com/danielkhachaturov/sol-hermes ~/.hermes/plugins/sol-hermes
+git clone https://github.com/wm2400/sol-hermes ~/.hermes/plugins/sol-hermes
 ```
 
 Add `sol-hermes` to `plugins.enabled` in `~/.hermes/config.yaml`:
@@ -24,20 +26,17 @@ plugins:
     - sol-hermes
 ```
 
-Restart Hermes. That's it.
+Restart Hermes.
 
 ## Uninstall
 
 ```bash
-rm -rf ~/.hermes/plugins/sol-hermes
-rm -rf ~/.hermes/sol-hermes   # stored observations, optional
+sh ~/.hermes/plugins/sol-hermes/uninstall.sh
 ```
-
-Remove from `plugins.enabled` and restart.
 
 ## Config
 
-Optional. Drop a `sol-hermes.json` in `~/.hermes/` or in a project's `.hermes/` folder:
+Only from `~/.hermes/sol-hermes.json` (never from project directory — security boundary):
 
 ```json
 {
@@ -46,21 +45,24 @@ Optional. Drop a `sol-hermes.json` in `~/.hermes/` or in a project's `.hermes/` 
   "evidence_reducer": true,
   "observation_threshold": 4000,
   "max_log_lines": 80,
-  "validators": {
-    ".py": ["python3 -m py_compile {path}"],
-    ".go": ["go vet ./..."]
-  }
+  "max_storage_mb": 500,
+  "obs_ttl_hours": 24
 }
 ```
 
-Project config overrides user config. Missing config means defaults: everything on, threshold 4000 chars, standard validators for py/js/ts/json/yaml.
-
 ## Security
 
-- Observations live in `~/.hermes/sol-hermes/obs/`, never leave your machine
-- No network calls, no telemetry, no API keys
-- `evidence_compress` is pure string processing
-- Stdlib only. Audit is one file.
+- No `shell=True` — validators run as list-form subprocess
+- Session names sanitized to `[a-zA-Z0-9_-]`
+- Config loaded only from `~/.hermes/`, never from CWD
+- Observations auto-delete after 24h, storage capped at 500MB
+- No network calls, no telemetry
+
+## Development
+
+```bash
+python -m unittest test_sol_hermes -v
+```
 
 ## License
 

@@ -4,43 +4,70 @@ import json
 import re
 import hashlib
 import subprocess
+import shlex
+import warnings
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 
 
 def load_config():
-    """Read config from sol-hermes.json if it exists."""
-    paths = [
-        Path.cwd() / ".hermes" / "sol-hermes.json",
-        Path.home() / ".hermes" / "sol-hermes.json",
-    ]
+    """Read config from sol-hermes.json if it exists. Never load from CWD."""
+    config_path = Path.home() / ".hermes" / "sol-hermes.json"
     defaults = {
         "action_fusion": True,
         "observation_pack": True,
         "evidence_reducer": True,
         "observation_threshold": 4000,
         "max_log_lines": 80,
+        "max_storage_mb": 500,
+        "obs_ttl_hours": 24,
         "validators": {
-            ".py": ["python3 -m py_compile {path}"],
-            ".js": ["node --check {path}"],
-            ".ts": ["npx tsc --noEmit"],
-            ".json": ["python3 -m json.tool {path}"],
-            ".yaml": ["python3 -c 'import yaml,sys; yaml.safe_load(open(sys.argv[1]))' {path}"],
-            ".yml": ["python3 -c 'import yaml,sys; yaml.safe_load(open(sys.argv[1]))' {path}"],
+            ".py": ["python3", "-m", "py_compile"],
+            ".js": ["node", "--check"],
+            ".ts": ["npx", "tsc", "--noEmit"],
+            ".json": ["python3", "-m", "json.tool"],
+            ".yaml": ["python3", "-c", "import yaml,sys; yaml.safe_load(open(sys.argv[1]))"],
+            ".yml": ["python3", "-c", "import yaml,sys; yaml.safe_load(open(sys.argv[1]))"],
         },
     }
-    for p in paths:
-        if p.exists():
-            try:
-                with open(p) as f:
-                    user = json.load(f)
-                return {**defaults, **user}
-            except Exception:
-                pass
+    if not config_path.exists():
+        return defaults
+    try:
+        with open(config_path) as f:
+            user = json.load(f)
+        unknown = set(user.keys()) - set(defaults.keys())
+        if unknown:
+            warnings.warn(f"sol-hermes: unknown config keys {unknown}, using defaults")
+        return {**defaults, **{k: v for k, v in user.items() if k in defaults}}
+    except json.JSONDecodeError as e:
+        warnings.warn(f"sol-hermes: bad JSON in {config_path}: {e}, using defaults")
+    except Exception as e:
+        warnings.warn(f"sol-hermes: failed to load {config_path}: {e}, using defaults")
     return defaults
 
 
 CFG = load_config()
+
+
+# --- token counter -----------------------------------------------------------
+
+def estimate_tokens(text):
+    """Rough token estimate: 1 token ~ 4 chars for English, ~3 for code."""
+    if not text:
+        return 0
+    return max(1, len(text) // 3)
+
+
+def count_saved(before, after):
+    tb = estimate_tokens(before)
+    ta = estimate_tokens(after)
+    saved = tb - ta
+    return {
+        "tokens_before": tb,
+        "tokens_after": ta,
+        "tokens_saved": saved,
+        "saved_percent": round((saved / max(1, tb)) * 100, 1),
+    }
 
 
 # --- action fusion -----------------------------------------------------------
@@ -48,25 +75,41 @@ CFG = load_config()
 def get_validators(path):
     ext = Path(path).suffix.lower()
     cmds = CFG["validators"].get(ext, [])
-    return [c.replace("{path}", path) for c in cmds]
+    return cmds
 
 
-def run_cmd(cmd, cwd):
+def run_cmd(cmd_list, cwd):
+    """Run validator without shell=True. Path passed as argv, not interpolated."""
     try:
-        p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30, cwd=cwd)
+        # Append the file path as the last argument
+        full_cmd = cmd_list + [cwd] if "{path}" not in " ".join(cmd_list) else [
+            c.replace("{path}", cwd) for c in cmd_list
+        ]
+        p = subprocess.run(
+            full_cmd,
+            shell=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            cwd=str(Path(cwd).parent),
+        )
         return {
-            "cmd": cmd,
+            "cmd": " ".join(full_cmd),
             "exit": p.returncode,
             "stdout": p.stdout[:800] if p.stdout else "",
             "stderr": p.stderr[:800] if p.stderr else "",
         }
     except Exception as e:
-        return {"cmd": cmd, "error": str(e)}
+        return {"cmd": " ".join(cmd_list), "error": str(e)}
 
 
 def sol_patch_validate(path, old_string, new_string, replace_all=False, validate=True):
     """Edit file and check it in one go."""
     result = {"ok": False, "file": path, "edit_applied": False, "validation": None}
+
+    if not old_string:
+        result["error"] = "old_string cannot be empty"
+        return json.dumps(result)
 
     try:
         with open(path, "r") as f:
@@ -88,7 +131,11 @@ def sol_patch_validate(path, old_string, new_string, replace_all=False, validate
 
     if validate and CFG["action_fusion"]:
         cmds = get_validators(path)
-        result["validation"] = [run_cmd(c, str(Path(path).parent)) for c in cmds]
+        result["validation"] = [run_cmd(c, path) for c in cmds]
+        result["token_stats"] = count_saved(
+            json.dumps({"path": path, "old": old_string, "new": new_string}),
+            json.dumps(result),
+        )
 
     return json.dumps(result)
 
@@ -99,11 +146,48 @@ class ObsStore:
     def __init__(self):
         self.dir = Path.home() / ".hermes" / "sol-hermes" / "obs"
         self.dir.mkdir(parents=True, exist_ok=True)
+        self._cleanup_old()
+
+    def _cleanup_old(self):
+        """Remove expired observations and enforce storage cap."""
+        now = datetime.now()
+        ttl = timedelta(hours=CFG["obs_ttl_hours"])
+        total_size = 0
+        files = []
+
+        for f in self.dir.rglob("*.txt"):
+            try:
+                stat = f.stat()
+                age = now - datetime.fromtimestamp(stat.st_mtime)
+                if age > ttl:
+                    f.unlink()
+                    continue
+                files.append((stat.st_mtime, f, stat.st_size))
+                total_size += stat.st_size
+            except Exception:
+                pass
+
+        max_bytes = CFG["max_storage_mb"] * 1024 * 1024
+        if total_size > max_bytes:
+            files.sort()
+            for _, f, size in files:
+                if total_size <= max_bytes:
+                    break
+                try:
+                    f.unlink()
+                    total_size -= size
+                except Exception:
+                    pass
+
+    def _sanitize_session(self, session):
+        """Only allow safe session names."""
+        return re.sub(r"[^a-zA-Z0-9_-]", "", session)[:64] or "default"
 
     def put(self, content, kind="text", session="default"):
         if len(content) < CFG["observation_threshold"]:
             return {"type": "inline", "content": content, "chars": len(content)}
 
+        session = self._sanitize_session(session)
         h = hashlib.sha256(content.encode()).hexdigest()[:12]
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         hid = f"obs_{ts}_{h}"
@@ -123,8 +207,15 @@ class ObsStore:
             "note": f"stored {len(content)} chars, recall with observation_recall",
         }
 
-    def get(self, hid, offset=0, limit=2000):
-        for d in self.dir.iterdir():
+    def get(self, hid, offset=0, limit=2000, session=None):
+        """Recall from a specific session, or search all if session=None."""
+        if offset < 0:
+            return {"error": "offset must be >= 0"}
+        if limit < 1 or limit > 50000:
+            return {"error": "limit must be 1-50000"}
+
+        dirs = [self.dir / session] if session else list(self.dir.iterdir())
+        for d in dirs:
             p = d / f"{hid}.txt"
             if p.exists():
                 with open(p) as f:
@@ -146,23 +237,31 @@ _store = ObsStore()
 
 
 def observation_pack(content, content_type="text", session_id="default"):
-    return json.dumps(_store.put(content, content_type, session_id))
+    result = _store.put(content, content_type, session_id)
+    if result["type"] == "handle":
+        result["token_stats"] = count_saved(content, json.dumps(result))
+    return json.dumps(result)
 
 
-def observation_recall(handle_id, offset=0, limit=2000):
-    return json.dumps(_store.get(handle_id, offset, limit))
+def observation_recall(handle_id, offset=0, limit=2000, session_id=None):
+    return json.dumps(_store.get(handle_id, offset, limit, session_id))
 
 
 # --- evidence reducer --------------------------------------------------------
 
 _ERR_RE = re.compile(
-    r"error|failed|exception|traceback|warning|fatal|panic",
+    r"\b(error|failed|exception|traceback|warning|fatal|panic)\b",
     re.IGNORECASE,
 )
 
 
 def evidence_compress(log_content, context_lines=3):
     """Pull out error sections from a long log."""
+    if not isinstance(log_content, str):
+        return json.dumps({"error": "log_content must be a string"})
+    if not isinstance(context_lines, int) or context_lines < 0:
+        context_lines = 3
+
     lines = log_content.split("\n")
     total = len(lines)
 
@@ -193,6 +292,7 @@ def evidence_compress(log_content, context_lines=3):
         out.append("")
 
     compressed = "\n".join(out)
+    stats = count_saved(log_content, compressed)
     return json.dumps({
         "type": "compressed",
         "original_lines": total,
@@ -200,39 +300,75 @@ def evidence_compress(log_content, context_lines=3):
         "sections": len(sections),
         "content": compressed,
         "ratio": f"{total / max(1, len(compressed.split(chr(10)))):.1f}x",
+        "token_stats": stats,
     })
 
 
 def evidence_verify(compressed_content, original_content):
     """Check that every quoted section actually exists in the original."""
-    parts = re.findall(
-        r"--- section \d+ \(lines \d+-\d+\) ---\n(.+?)(?=\n\n|\Z)",
-        compressed_content,
-        re.DOTALL,
-    )
+    # Extract only the raw content lines, skip section headers
+    lines = compressed_content.split("\n")
+    sections = []
+    current = []
+    in_section = False
+
+    for line in lines:
+        if line.startswith("--- section "):
+            if in_section and current:
+                sections.append("\n".join(current))
+            current = []
+            in_section = True
+        elif in_section:
+            if line.strip() == "":
+                if current:
+                    sections.append("\n".join(current))
+                    current = []
+                in_section = False
+            else:
+                current.append(line)
+
+    if in_section and current:
+        sections.append("\n".join(current))
+
+    if not sections:
+        return json.dumps({"all_ok": False, "error": "no sections found", "checked": 0, "details": []})
+
     ok = True
     results = []
-    for p in parts:
-        p = p.strip()
-        found = p in original_content
-        results.append({"preview": p[:80] + ("..." if len(p) > 80 else ""), "ok": found})
+    for section in sections:
+        section = section.strip()
+        if not section:
+            continue
+        found = section in original_content
+        results.append({"preview": section[:80] + ("..." if len(section) > 80 else ""), "ok": found})
         if not found:
             ok = False
+
     return json.dumps({"all_ok": ok, "checked": len(results), "details": results})
 
 
-# --- hook: auto-pack big outputs ---------------------------------------------
+# --- hooks -------------------------------------------------------------------
 
-def _auto_pack(tool_name, params, result, **kw):
+def _transform_result(tool_name, params, result, **kw):
+    """Replace large tool results with a handle. Actually saves tokens."""
     if not CFG["observation_pack"]:
-        return
+        return result
     if tool_name not in ("terminal", "read_file", "search_files"):
-        return
-    if len(result) < CFG["observation_threshold"]:
-        return
-    packed = _store.put(result, f"auto_{tool_name}", "auto")
+        return result
+    if not isinstance(result, str) or len(result) < CFG["observation_threshold"]:
+        return result
+
+    session_id = kw.get("session_id", "default")
+    packed = _store.put(result, f"auto_{tool_name}", session_id)
     if packed["type"] == "handle":
-        print(f"[sol-hermes] packed {len(result)} chars from {tool_name} -> {packed['handle_id']}")
+        return json.dumps({
+            "type": "handle",
+            "handle_id": packed["handle_id"],
+            "chars": packed["chars"],
+            "preview": packed["preview"],
+            "note": f"Large output auto-packed. Use observation_recall with handle_id '{packed['handle_id']}' to read it.",
+        })
+    return result
 
 
 # --- plugin registration -----------------------------------------------------
@@ -297,12 +433,13 @@ def register(ctx):
                     "handle_id": {"type": "string"},
                     "offset": {"type": "integer", "default": 0},
                     "limit": {"type": "integer", "default": 2000},
+                    "session_id": {"type": "string", "default": None},
                 },
                 "required": ["handle_id"],
             },
         },
         handler=lambda p, **kw: observation_recall(
-            p["handle_id"], p.get("offset", 0), p.get("limit", 2000),
+            p["handle_id"], p.get("offset", 0), p.get("limit", 2000), p.get("session_id"),
         ),
     )
 
@@ -346,6 +483,7 @@ def register(ctx):
         ),
     )
 
-    ctx.register_hook("post_tool_call", _auto_pack)
+    # This hook actually replaces large results, not just logs them
+    ctx.register_hook("transform_tool_result", _transform_result)
 
     print("[sol-hermes] loaded")
