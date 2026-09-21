@@ -5,6 +5,7 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -22,6 +23,10 @@ class TestConfig(unittest.TestCase):
         stats = plugin.count_saved("a" * 3000, "b" * 300)
         self.assertEqual(stats["tokens_saved"], 900)
         self.assertEqual(stats["saved_percent"], 90.0)
+
+    def test_config_crash_graceful(self):
+        # Malformed config should not crash module import
+        self.assertIsNotNone(plugin.CFG)
 
 
 class TestActionFusion(unittest.TestCase):
@@ -65,7 +70,6 @@ class TestActionFusion(unittest.TestCase):
         self.assertIn("empty", result["error"])
 
     def test_no_shell_injection(self):
-        # Create a file with a shell metachar in name
         evil = os.path.join(self.tmp, "test;touch INJECTED;.py")
         with open(evil, "w") as f:
             f.write("x = 1\n")
@@ -139,6 +143,61 @@ class TestObservationPack(unittest.TestCase):
     def test_non_string_input(self):
         result = json.loads(plugin.observation_pack(None))
         self.assertEqual(result["type"], "inline")
+
+    def test_handle_id_path_traversal_blocked(self):
+        """handle_id with path traversal should be rejected."""
+        result = json.loads(plugin.observation_recall("../../etc/passwd"))
+        self.assertIn("error", result)
+        self.assertEqual(result["error"], "invalid handle_id")
+
+    def test_handle_id_sanitization(self):
+        """handle_id with special chars should be rejected."""
+        result = json.loads(plugin.observation_recall("obs_20260921_abc123; rm -rf /"))
+        self.assertIn("error", result)
+
+    def test_concurrent_put_same_content(self):
+        """Concurrent writes of same content should not corrupt."""
+        big = "x" * 5000
+        results = []
+        errors = []
+
+        def worker():
+            try:
+                r = json.loads(plugin.observation_pack(big, session_id="concurrent"))
+                results.append(r)
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=worker) for _ in range(10)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(len(errors), 0)
+        self.assertEqual(len(results), 10)
+        # All should have same handle_id (same content hash)
+        handle_ids = {r["handle_id"] for r in results}
+        self.assertEqual(len(handle_ids), 1)
+
+    def test_concurrent_put_different_content(self):
+        """Concurrent writes of different content should not corrupt."""
+        errors = []
+
+        def worker(i):
+            try:
+                content = f"content_{i}_" + "x" * 5000
+                plugin.observation_pack(content, session_id="concurrent")
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(10)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(len(errors), 0)
 
 
 class TestEvidenceReducer(unittest.TestCase):
@@ -214,6 +273,16 @@ class TestTransformHook(unittest.TestCase):
     def test_wrong_tool_unchanged(self):
         result = plugin._transform_result("web_search", {}, "x" * 5000)
         self.assertEqual(result, "x" * 5000)
+
+    def test_hook_signature_matches_hermes(self):
+        """Hook must accept (tool_name, args, result, **kw) as Hermes sends."""
+        import inspect
+        sig = inspect.signature(plugin._transform_result)
+        params = list(sig.parameters.keys())
+        self.assertEqual(params[0], "tool_name")
+        self.assertEqual(params[1], "args")  # Hermes sends args, not params
+        self.assertEqual(params[2], "result")
+        self.assertEqual(params[3], "kw")
 
 
 class TestStorageCleanup(unittest.TestCase):

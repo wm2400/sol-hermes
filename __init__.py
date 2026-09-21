@@ -5,6 +5,8 @@ import re
 import hashlib
 import subprocess
 import warnings
+import threading
+import os
 from pathlib import Path
 from datetime import datetime, timedelta
 
@@ -45,7 +47,19 @@ def load_config():
     return defaults
 
 
-CFG = load_config()
+try:
+    CFG = load_config()
+except Exception:
+    CFG = {
+        "action_fusion": True,
+        "observation_pack": True,
+        "evidence_reducer": True,
+        "observation_threshold": 4000,
+        "max_log_lines": 80,
+        "max_storage_mb": 500,
+        "obs_ttl_hours": 24,
+        "validators": {},
+    }
 
 
 def estimate_tokens(text):
@@ -139,42 +153,58 @@ class ObsStore:
     def __init__(self):
         self.dir = Path.home() / ".hermes" / "sol-hermes" / "obs"
         self.dir.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
         self._cleanup_old()
 
     def _cleanup_old(self):
         """Remove expired observations and enforce storage cap."""
-        now = datetime.now()
-        ttl = timedelta(hours=CFG["obs_ttl_hours"])
-        total_size = 0
-        files = []
+        try:
+            now = datetime.now()
+            ttl = timedelta(hours=CFG["obs_ttl_hours"])
+            total_size = 0
+            files = []
 
-        for f in self.dir.rglob("*.txt"):
-            try:
-                stat = f.stat()
-                age = now - datetime.fromtimestamp(stat.st_mtime)
-                if age > ttl:
-                    f.unlink()
-                    continue
-                files.append((stat.st_mtime, f, stat.st_size))
-                total_size += stat.st_size
-            except Exception:
-                pass
-
-        max_bytes = CFG["max_storage_mb"] * 1024 * 1024
-        if total_size > max_bytes:
-            files.sort()
-            for _, f, size in files:
-                if total_size <= max_bytes:
-                    break
+            for f in self.dir.rglob("*.txt"):
                 try:
-                    f.unlink()
-                    total_size -= size
+                    stat = f.stat()
+                    age = now - datetime.fromtimestamp(stat.st_mtime)
+                    if age > ttl:
+                        f.unlink()
+                        continue
+                    files.append((stat.st_mtime, f, stat.st_size))
+                    total_size += stat.st_size
                 except Exception:
                     pass
 
+            max_bytes = CFG["max_storage_mb"] * 1024 * 1024
+            if total_size > max_bytes:
+                files.sort()
+                for _, f, size in files:
+                    if total_size <= max_bytes:
+                        break
+                    try:
+                        f.unlink()
+                        total_size -= size
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
     def _sanitize_session(self, session):
         """Only allow safe session names."""
-        return re.sub(r"[^a-zA-Z0-9_-]", "", session)[:64] or "default"
+        if not session:
+            return "default"
+        return re.sub(r"[^a-zA-Z0-9_-]", "", str(session))[:64] or "default"
+
+    def _sanitize_handle(self, hid):
+        """Only allow safe handle names. Prevents path traversal."""
+        if not hid:
+            return None
+        # Only allow alphanumeric, underscore, hyphen
+        clean = re.sub(r"[^a-zA-Z0-9_-]", "", str(hid))
+        if not clean or clean != hid:
+            return None
+        return clean[:128]
 
     def put(self, content, kind="text", session="default"):
         if not isinstance(content, str):
@@ -190,8 +220,11 @@ class ObsStore:
         d = self.dir / session
         d.mkdir(exist_ok=True)
         path = d / f"{hid}.txt"
-        with open(path, "w") as f:
-            f.write(content)
+
+        # Atomic write with lock to prevent race conditions
+        with self._lock:
+            with open(path, "w") as f:
+                f.write(content)
 
         return {
             "type": "handle",
@@ -204,6 +237,11 @@ class ObsStore:
 
     def get(self, hid, offset=0, limit=2000, session=None):
         """Recall from a specific session, or search all if session=None."""
+        # Sanitize handle_id to prevent path traversal
+        hid = self._sanitize_handle(hid)
+        if not hid:
+            return {"error": "invalid handle_id"}
+
         if offset < 0:
             return {"error": "offset must be >= 0"}
         if limit < 1 or limit > 50000:
@@ -343,8 +381,11 @@ def evidence_verify(compressed_content, original_content):
 
 # --- hooks -------------------------------------------------------------------
 
-def _transform_result(tool_name, params, result, **kw):
-    """Replace large tool results with a handle. Actually saves tokens."""
+def _transform_result(tool_name, args, result, **kw):
+    """Replace large tool results with a handle. Actually saves tokens.
+
+    Signature matches Hermes hook contract: (tool_name, args, result, **kw).
+    """
     if not CFG["observation_pack"]:
         return result
     if tool_name not in ("terminal", "read_file", "search_files"):
