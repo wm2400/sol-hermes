@@ -1,0 +1,21 @@
+name: sol-hermes
+version: "1.0.0"
+description: "Token-efficiency plugin inspired by SoL-Pi: action fusion, observation pack, evidence reducer, context compact"
+author: "Daniel Khachaturov"
+license: MIT
+homepage: "https://github.com/danielkhachaturov/sol-hermes"
+
+# Tools registered by this plugin
+tools:
+  - sol_patch_validate
+  - observation_pack
+  - observation_recall
+  - evidence_compress
+  - evidence_verify
+
+# Hooks
+hooks:
+  - post_tool_call
+
+# Config file (optional)
+config_file: sol-hermes.json
