@@ -5,17 +5,12 @@ author: "Daniel Khachaturov"
 license: MIT
 homepage: "https://github.com/danielkhachaturov/sol-hermes"
 
-# Tools registered by this plugin
-tools:
+provides_tools:
   - sol_patch_validate
   - observation_pack
   - observation_recall
   - evidence_compress
   - evidence_verify
 
-# Hooks
-hooks:
+provides_hooks:
   - transform_tool_result
-
-# Config file (optional)
-config_file: sol-hermes.json
