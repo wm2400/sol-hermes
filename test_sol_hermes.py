@@ -134,6 +134,20 @@ class TestObservationPack(unittest.TestCase):
         result = json.loads(plugin.observation_recall(packed["handle_id"], -5, 100))
         self.assertIn("error", result)
 
+    def test_recall_offset_string(self):
+        big = "x" * 5000
+        packed = json.loads(plugin.observation_pack(big))
+        result = json.loads(plugin.observation_recall(packed["handle_id"], "0", 100))
+        self.assertIn("error", result)
+        self.assertEqual(result["error"], "offset must be an integer")
+
+    def test_recall_limit_string(self):
+        big = "x" * 5000
+        packed = json.loads(plugin.observation_pack(big))
+        result = json.loads(plugin.observation_recall(packed["handle_id"], 0, "100"))
+        self.assertIn("error", result)
+        self.assertEqual(result["error"], "limit must be an integer")
+
     def test_recall_bad_limit(self):
         big = "x" * 5000
         packed = json.loads(plugin.observation_pack(big))

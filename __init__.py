@@ -39,6 +39,11 @@ def load_config():
         unknown = set(user.keys()) - set(defaults.keys())
         if unknown:
             warnings.warn(f"sol-hermes: unknown config keys {unknown}, using defaults")
+        # Validate types for numeric config values
+        for key in ("observation_threshold", "max_log_lines", "max_storage_mb", "obs_ttl_hours"):
+            if key in user and not isinstance(user[key], (int, float)):
+                warnings.warn(f"sol-hermes: {key} must be a number, using default")
+                user.pop(key)
         return {**defaults, **{k: v for k, v in user.items() if k in defaults}}
     except json.JSONDecodeError as e:
         warnings.warn(f"sol-hermes: bad JSON in {config_path}: {e}, using defaults")
@@ -212,6 +217,9 @@ class ObsStore:
         if len(content) < CFG["observation_threshold"]:
             return {"type": "inline", "content": content, "chars": len(content)}
 
+        # Run cleanup on every put to enforce TTL and cap during long sessions
+        self._cleanup_old()
+
         session = self._sanitize_session(session)
         h = hashlib.sha256(content.encode()).hexdigest()[:12]
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -242,6 +250,10 @@ class ObsStore:
         if not hid:
             return {"error": "invalid handle_id"}
 
+        if not isinstance(offset, int):
+            return {"error": "offset must be an integer"}
+        if not isinstance(limit, int):
+            return {"error": "limit must be an integer"}
         if offset < 0:
             return {"error": "offset must be >= 0"}
         if limit < 1 or limit > 50000:

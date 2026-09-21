@@ -15,7 +15,7 @@ tools:
 
 # Hooks
 hooks:
-  - post_tool_call
+  - transform_tool_result
 
 # Config file (optional)
 config_file: sol-hermes.json
